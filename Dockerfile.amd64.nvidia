@@ -1,0 +1,239 @@
+################################################################################
+# base system
+################################################################################
+
+FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu20.04 as system
+
+RUN sed -i 's#http://archive.ubuntu.com/ubuntu/#mirror://mirrors.ubuntu.com/mirrors.txt#' /etc/apt/sources.list;
+
+# built-in packages
+ENV DEBIAN_FRONTEND noninteractive
+RUN apt update \
+    && apt install -y --no-install-recommends software-properties-common curl apache2-utils \
+    && apt update \
+    && apt install -y --no-install-recommends --allow-unauthenticated \
+        supervisor nginx sudo net-tools zenity xz-utils \
+        dbus-x11 x11-utils alsa-utils \
+        mesa-utils libgl1-mesa-dri \
+    && apt autoclean -y \
+    && apt autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+
+# install debs error if combine together
+RUN apt update \
+    && apt install -y --no-install-recommends --allow-unauthenticated \
+        xvfb x11vnc \
+        vim-tiny firefox ttf-ubuntu-font-family ttf-wqy-zenhei  \
+    && apt autoclean -y \
+    && apt autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN apt update \
+    && apt install -y --no-install-recommends --allow-unauthenticated \
+        lxde gtk2-engines-murrine gnome-themes-standard gtk2-engines-pixbuf gtk2-engines-murrine arc-theme \
+    && apt autoclean -y \
+    && apt autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+
+# tini to fix subreap
+ARG TINI_VERSION=v0.19.0
+ADD https://github.com/krallin/tini/releases/download/${TINI_VERSION}/tini /bin/tini
+RUN chmod +x /bin/tini
+
+# python library
+COPY rootfs/usr/local/lib/web/backend/requirements.txt /tmp/
+RUN apt-get update \
+    && dpkg-query -W -f='${Package}\n' > /tmp/a.txt \
+    && apt-get install -y python3-pip python3-dev build-essential \
+	&& pip3 install setuptools wheel && pip3 install -r /tmp/requirements.txt \
+    && ln -s /usr/bin/python3 /usr/local/bin/python \
+    && dpkg-query -W -f='${Package}\n' > /tmp/b.txt \
+    && apt-get remove -y `diff --changed-group-format='%>' --unchanged-group-format='' /tmp/a.txt /tmp/b.txt | xargs` \
+    && apt-get autoclean -y \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /var/cache/apt/* /tmp/a.txt /tmp/b.txt
+
+
+################################################################################
+# builder
+################################################################################
+FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu20.04 as builder
+
+RUN sed -i 's#http://archive.ubuntu.com/ubuntu/#mirror://mirrors.ubuntu.com/mirrors.txt#' /etc/apt/sources.list;
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates gnupg patch
+
+# nodejs
+RUN curl -sL https://deb.nodesource.com/setup_12.x | bash - \
+    && apt-get install -y nodejs
+
+# yarn
+RUN curl -sS https://dl.yarnpkg.com/debian/pubkey.gpg | apt-key add - \
+    && echo "deb https://dl.yarnpkg.com/debian/ stable main" | tee /etc/apt/sources.list.d/yarn.list \
+    && apt-get update \
+    && apt-get install -y yarn
+
+# build frontend
+COPY web /src/web
+RUN cd /src/web \
+    && yarn \
+    && yarn build
+RUN sed -i 's#app/locale/#novnc/app/locale/#' /src/web/dist/static/novnc/app/ui.js
+
+
+################################################################################
+# builder_rdp
+################################################################################
+FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu20.04 as builder_rdp
+
+# Install packages
+
+ENV DEBIAN_FRONTEND noninteractive
+RUN sed -i "s/# deb-src/deb-src/g" /etc/apt/sources.list
+RUN apt-get -y update
+RUN apt-get -yy upgrade
+ENV BUILD_DEPS="git autoconf pkg-config libssl-dev libpam0g-dev \
+    libx11-dev libxfixes-dev libxrandr-dev nasm xsltproc flex \
+    bison libxml2-dev dpkg-dev libcap-dev"
+RUN apt-get -yy install  sudo apt-utils software-properties-common $BUILD_DEPS
+
+# Build xrdp
+
+WORKDIR /tmp
+RUN apt-get source pulseaudio
+RUN apt-get build-dep -yy pulseaudio
+WORKDIR /tmp/pulseaudio-13.99.1
+RUN dpkg-buildpackage -rfakeroot -uc -b
+WORKDIR /tmp
+RUN git clone --branch devel --recursive https://github.com/neutrinolabs/xrdp.git
+WORKDIR /tmp/xrdp
+RUN ./bootstrap
+RUN ./configure
+RUN make
+RUN make install
+WORKDIR /tmp
+RUN  apt -yy install libpulse-dev
+RUN git clone --recursive https://github.com/neutrinolabs/pulseaudio-module-xrdp.git
+WORKDIR /tmp/pulseaudio-module-xrdp
+RUN ./bootstrap && ./configure PULSE_DIR=/tmp/pulseaudio-13.99.1
+RUN make
+RUN mkdir -p /tmp/so
+RUN cp src/.libs/*.so /tmp/so
+
+################################################################################
+# merge
+################################################################################
+FROM system
+LABEL maintainer="MASUTANI Yasuhiro <ai-robot-book@googlegroups.com>"
+
+COPY --from=builder /src/web/dist/ /usr/local/lib/web/frontend/
+COPY rootfs /
+RUN ln -sf /usr/local/lib/web/frontend/static/websockify /usr/local/lib/web/frontend/static/novnc/utils/websockify && \
+	chmod +x /usr/local/lib/web/frontend/static/websockify/run
+
+RUN apt-get update -q && \
+    apt-get upgrade -yq && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -yq crudini pulseaudio uuid-runtime xrdp locales && \
+    rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /var/lib/xrdp-pulseaudio-installer
+COPY --from=builder_rdp /tmp/so/module-xrdp-source.so /var/lib/xrdp-pulseaudio-installer
+COPY --from=builder_rdp /tmp/so/module-xrdp-sink.so /var/lib/xrdp-pulseaudio-installer
+COPY xrdp /etc
+
+# Configure
+RUN mkdir /var/run/dbus && \
+  cp /etc/X11/xrdp/xorg.conf /etc/X11 && \
+  sed -i "s/console/anybody/g" /etc/X11/Xwrapper.config && \
+  sed -i "s/xrdp\/xorg/xorg/g" /etc/xrdp/sesman.ini && \
+  locale-gen ja_JP.UTF-8 && \
+  rm -rf /etc/xrdp/rsakeys.ini /etc/xrdp/*.pem
+
+# RUN wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | apt-key add - 
+RUN apt-get update -q && \
+    apt-get upgrade -yq && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -yq wget curl git g++ build-essential vim sudo lsb-release locales bash-completion tzdata gosu && \
+    rm -rf /var/lib/apt/lists/*
+RUN wget -qO - https://gitlab.com/paulcarroty/vscodium-deb-rpm-repo/raw/master/pub.gpg \
+    | gpg --dearmor \
+    | dd of=/usr/share/keyrings/vscodium-archive-keyring.gpg && \
+    echo 'deb [ signed-by=/usr/share/keyrings/vscodium-archive-keyring.gpg ] https://paulcarroty.gitlab.io/vscodium-deb-rpm-repo/debs vscodium main' \
+    | tee /etc/apt/sources.list.d/vscodium.list && \
+    apt-get update -q && \
+    apt-get -y install python3-pip && \
+    apt-get -y install language-pack-ja fonts-takao fcitx-mozc dbus-x11 && \
+    apt-get -y install codium && \
+    apt-get -y install xscreensaver && \
+    rm -rf /var/lib/apt/lists/*
+RUN useradd --create-home --home-dir /home/ubuntu --shell /bin/bash --user-group --groups adm,sudo ubuntu && \
+    echo ubuntu:ubuntu | chpasswd && \
+    echo "ubuntu ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+RUN gosu ubuntu echo 'export DONT_PROMPT_WSL_INSTALL=1' >> /home/ubuntu/.bashrc && \
+    gosu ubuntu bash -c "DONT_PROMPT_WSL_INSTALL=1 codium --install-extension ms-ceintl.vscode-language-pack-ja" && \
+    gosu ubuntu bash -c "DONT_PROMPT_WSL_INSTALL=1 codium --install-extension ms-python.python"
+
+RUN gosu ubuntu cp /root/.gtkrc-2.0 /home/ubuntu
+
+ARG ROS_DISTRO=foxy
+ARG INSTALL_PACKAGE=desktop
+
+# rosdep initを除いたもの
+###
+RUN apt-get update -q && \
+    apt-get install -y curl gnupg2 lsb-release && \
+    curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key -o /usr/share/keyrings/ros-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/ros2.list > /dev/null && \
+    apt-get update -q && \
+    apt-get install -y ros-${ROS_DISTRO}-${INSTALL_PACKAGE} \
+    python3-argcomplete \
+    python3-colcon-common-extensions \
+    python3-rosdep python3-vcstool \
+    ros-${ROS_DISTRO}-gazebo-ros-pkgs && \
+    rm -rf /var/lib/apt/lists/*
+###
+
+# rosdep init するもの
+###
+# RUN apt-get update -q && \
+#     apt-get install -y curl gnupg2 lsb-release && \
+#     curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key -o /usr/share/keyrings/ros-archive-keyring.gpg && \
+#     echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/ros2.list > /dev/null && \
+#     apt-get update -q && \
+#     apt-get install -y ros-${ROS_DISTRO}-${INSTALL_PACKAGE} \
+#     python3-argcomplete \
+#     python3-colcon-common-extensions \
+#     python3-rosdep python3-vcstool \
+#     ros-${ROS_DISTRO}-gazebo-ros-pkgs && \
+#     rosdep init && \
+#     rm -rf /var/lib/apt/lists/*
+###
+
+RUN gosu ubuntu rosdep update && \
+    grep -F "source /opt/ros/${ROS_DISTRO}/setup.bash" /home/ubuntu/.bashrc || echo "source /opt/ros/${ROS_DISTRO}/setup.bash" >> /home/ubuntu/.bashrc && \
+    sudo chown ubuntu:ubuntu /home/ubuntu/.bashrc
+
+# temporally fix to enable resize uri
+# https://github.com/fcwu/docker-ubuntu-vnc-desktop/pull/247
+RUN sed -i "s#location ~ .*/(api/.*|websockify) {#location ~ .*/(api/.*|websockify|resize) {#" /etc/nginx/sites-enabled/default
+
+ENV USER ubuntu
+
+# docker run の際に 以下のエラーを回避するために
+# ImportError: cannot import name 'soft_unicode' from 'markupsafe'
+# (/home/ubuntu/.local/lib/python3.8/site-packages/markupsafe/__init__.py)
+# werkzeugの問題回避
+# https://github.com/mjmeijer/donald_2021/issues/4
+RUN gosu ubuntu pip3 install werkzeug==2.0.3
+
+COPY ./ai-robot-book.sh /ai-robot-book.sh
+RUN mkdir -p /tmp/ros_setup_scripts_ubuntu && mv /ai-robot-book.sh /tmp/ros_setup_scripts_ubuntu/ && \
+    gosu ubuntu /tmp/ros_setup_scripts_ubuntu/ai-robot-book.sh
+
+EXPOSE 80
+WORKDIR /root
+ENV HOME=/home/ubuntu \
+    SHELL=/bin/bash
+HEALTHCHECK --interval=30s --timeout=5s CMD curl --fail http://127.0.0.1:6079/api/health
+# ENTRYPOINT ["/startup.sh"]

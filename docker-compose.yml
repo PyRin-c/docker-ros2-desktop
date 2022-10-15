@@ -1,0 +1,30 @@
+version: "3.8"
+
+services:
+  ros2:
+    build:
+      context: .
+      dockerfile: Dockerfile.amd64.nvidia
+      shm_size: '512m'
+    image: robotics:20.04-nvidia-ros2
+    shm_size: '512m'
+    privileged: true
+    command: sh -c "/startup.sh"
+    ports:
+      - "15900:5900"
+      - "13389:3389"
+      - "6080:80"
+    volumes:
+      - ./share:/root/share
+    environment:
+      RESOLUTION: 1920x1080
+      # http_proxy: "%http_proxy%"
+      # https_proxy: "%https_proxy%"
+      # HTTP_PROXY: "%HTTP_PROXY%"
+      # HTTPS_PROXY: "%HTTPS_PROXY%"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [utility, compute, video]
